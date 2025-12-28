@@ -219,7 +219,7 @@ def run_news_agent(country: str = "us", category: str = "technology", limit: int
             resp = client.chat_completion(
                 model=HF_MODEL,
                 messages=messages,
-                max_tokens=900,
+                max_tokens=10000,
                 temperature=0.2,
             )
             return resp.choices[0].message.content or ""

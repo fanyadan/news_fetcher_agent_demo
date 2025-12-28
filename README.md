@@ -1,10 +1,15 @@
-# News Agent (Hugging Face tool calling + NewsAPI)
+# News Agent (Hugging Face + NewsAPI)
 
-`news_agent_hf_toolcall.py` is a small “news agent” demo that:
+This repo contains two small “news agent” demos:
 
-- Fetches **live** headlines from **NewsAPI** (`/v2/top-headlines`)
-- Uses a Hugging Face-hosted LLM (via `huggingface_hub.InferenceClient`) to **summarize and format** the headlines
-- Attempts **OpenAI-style tool/function calling** first, and falls back to a manual JSON-to-summary flow if the model/provider doesn’t support tool calls
+- `news_agent_hf_toolcall.py`: uses `huggingface_hub.InferenceClient` directly (no LangChain).
+- `news_agent_langchain.py`: uses a LangChain agent graph (`langchain.agents.create_agent`) with a small Hugging Face chat-model wrapper.
+
+Both scripts:
+
+- Fetch **live** headlines from **NewsAPI** (`/v2/top-headlines`)
+- Use a Hugging Face-hosted LLM (via `huggingface_hub.InferenceClient`) to **summarize and format** the headlines
+- Attempt **OpenAI-style tool/function calling** first, and fall back to a manual JSON-to-summary flow if the model/provider doesn’t support tool calls
 
 The output is a Markdown digest with one section per headline:
 
@@ -15,6 +20,8 @@ The output is a Markdown digest with one section per headline:
 
 ## Requirements
 
+Common (both scripts):
+
 - Python 3.9+
 - A **NewsAPI** key
 - A **Hugging Face** token with access to your chosen Inference Provider/model
@@ -22,10 +29,20 @@ The output is a Markdown digest with one section per headline:
   - `requests`
   - `huggingface_hub`
 
+For `news_agent_langchain.py` (LangChain agent):
+
+- Python packages:
+  - `langchain`
+  - `langgraph`
+  - `pydantic`
+
 Install dependencies:
 
 ```bash
 pip install -U requests huggingface_hub
+
+# Only needed for the LangChain version
+pip install -U langchain langgraph pydantic
 ```
 
 ## Configuration
@@ -42,6 +59,11 @@ The script reads the following environment variables:
 - `HF_PROVIDER` (optional, default: `novita`)
 - `HF_MODEL` (optional, default: `zai-org/GLM-4.6`)
 
+Only for `news_agent_langchain.py`:
+
+- `HF_MAX_TOKENS` (optional, default: `10000`)
+- `HF_TEMPERATURE` (optional, default: `0.2`)
+
 > Note: Many large models are not available on the free `hf-inference` (serverless) tier and can return 404. Using an Inference Provider (like `novita`) and a compatible model is often required.
 
 Example:
@@ -57,8 +79,16 @@ export HF_MODEL="zai-org/GLM-4.6"
 
 ## Run
 
+No LangChain (direct Hugging Face calls):
+
 ```bash
 python news_agent_hf_toolcall.py
+```
+
+LangChain agent version:
+
+```bash
+python news_agent_langchain.py
 ```
 
 By default, the script prints “Daily Tech Headlines” for:
@@ -69,10 +99,19 @@ By default, the script prints “Daily Tech Headlines” for:
 
 ## Programmatic usage
 
-You can import and call `run_news_agent(...)`:
+### `news_agent_hf_toolcall.py`
 
 ```python
 from news_agent_hf_toolcall import run_news_agent
+
+md = run_news_agent(country="us", category="technology", limit=5)
+print(md)
+```
+
+### `news_agent_langchain.py`
+
+```python
+from news_agent_langchain import run_news_agent
 
 md = run_news_agent(country="us", category="technology", limit=5)
 print(md)
@@ -96,7 +135,7 @@ Parameters:
   - `url`
   - `source`
 
-### Tool calling loop
+### `news_agent_hf_toolcall.py` (no LangChain)
 
 `run_news_agent()`:
 
@@ -104,9 +143,15 @@ Parameters:
 2. If the model returns `tool_calls`, Python executes them and appends `role="tool"` messages containing the JSON output.
 3. The model then generates the final Markdown summary.
 
+### `news_agent_langchain.py` (LangChain agent)
+
+- Wraps `huggingface_hub.InferenceClient.chat_completion(...)` in a minimal LangChain `BaseChatModel` (`HFInferenceChatModel`).
+- Builds an agent graph with `langchain.agents.create_agent(...)`.
+- LangChain drives the tool-calling loop by reading `AIMessage.tool_calls`, executing tools, and feeding tool results back as `ToolMessage`.
+
 ### Fallback mode
 
-If tool calling isn’t supported (or certain HTTP errors occur), it falls back to:
+If tool calling isn’t supported (or certain HTTP errors occur), both scripts fall back to:
 
 1. Call `fetch_top_headlines(...)` directly in Python.
 2. Send the resulting JSON to the model and instruct it to use **only** that JSON (no outside knowledge).
@@ -127,6 +172,14 @@ Set `HF_TOKEN` (or `HUGGINGFACEHUB_API_TOKEN` / `HF_API_KEY`):
 
 ```bash
 export HF_TOKEN="..."
+```
+
+### Missing LangChain dependencies
+
+If you see import errors for `langchain` / `langgraph`, install the LangChain deps:
+
+```bash
+pip install -U langchain langgraph pydantic
 ```
 
 ### 404 / model not found / provider mismatch

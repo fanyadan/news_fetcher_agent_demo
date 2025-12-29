@@ -64,6 +64,13 @@ Only for `news_agent_langchain.py`:
 - `HF_MAX_TOKENS` (optional, default: `10000`)
 - `HF_TEMPERATURE` (optional, default: `0.2`)
 
+### Distributed / multi-process execution
+
+If you run these scripts under a multi-process launcher (e.g. `torchrun`, Slurm, MPI), they default to **rank 0 only** to avoid duplicating external API calls.
+
+- `NEWS_AGENT_DISTRIBUTED_MODE` (optional, default: `rank0`) — set to `all` to run on every rank.
+- Manual overrides (optional): `NEWS_AGENT_RANK`, `NEWS_AGENT_WORLD_SIZE`, `NEWS_AGENT_LOCAL_RANK`.
+
 > Note: Many large models are not available on the free `hf-inference` (serverless) tier and can return 404. Using an Inference Provider (like `novita`) and a compatible model is often required.
 
 Example:

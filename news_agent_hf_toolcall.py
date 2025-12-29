@@ -6,6 +6,8 @@ import requests
 from huggingface_hub import InferenceClient
 from huggingface_hub.errors import BadRequestError, HfHubHTTPError
 
+from dist_utils import rank0_print, should_run_on_this_rank
+
 
 HF_TOKEN = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACEHUB_API_TOKEN") or os.getenv("HF_API_KEY")
 # NOTE: Many large LLMs are not hosted on the free `hf-inference` (serverless) tier and will 404.
@@ -91,6 +93,11 @@ def _parse_tool_args(tool_call: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def run_news_agent(country: str = "us", category: str = "technology", limit: int = 5) -> str:
+    # In distributed/multi-process launches (torchrun/Slurm/MPI), default to rank-0 only to
+    # avoid duplicating API calls and rate-limiting.
+    if not should_run_on_this_rank():
+        return ""
+
     if not HF_TOKEN:
         return "Missing HF_TOKEN (or HF_API_KEY). You need a HF token with Inference Providers permission."
 
@@ -187,7 +194,7 @@ def run_news_agent(country: str = "us", category: str = "technology", limit: int
 
     # Fallback: call the tool in Python and ask the model to format + summarize.
     if fallback_to_manual:
-        print(f"The model does not support function-call, fallback to manual \n")
+        rank0_print("The model does not support function-call, fallback to manual\n")
         tool_output = fetch_top_headlines(country=country, category=category, limit=limit)
         if "error" in tool_output:
             return str(tool_output["error"])
@@ -230,5 +237,6 @@ def run_news_agent(country: str = "us", category: str = "technology", limit: int
 
 
 if __name__ == "__main__":
-    print("Daily Tech Headlines:\n")
-    print(run_news_agent(country="us", category="technology", limit=5))
+    if should_run_on_this_rank():
+        print("Daily Tech Headlines:\n")
+        print(run_news_agent(country="us", category="technology", limit=5))

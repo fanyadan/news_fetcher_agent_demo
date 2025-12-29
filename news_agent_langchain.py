@@ -6,6 +6,8 @@ import os
 import ssl
 from typing import Any, Dict, List, Optional, Sequence
 
+from dist_utils import should_run_on_this_rank
+
 # Third-party imports
 import requests
 import urllib3
@@ -276,6 +278,11 @@ class HFInferenceChatModel(BaseChatModel):
 
 
 def run_news_agent(country: str = "us", category: str = "technology", limit: int = 5) -> str:
+    # In distributed/multi-process launches (torchrun/Slurm/MPI), default to rank-0 only to
+    # avoid duplicating API calls and rate-limiting.
+    if not should_run_on_this_rank():
+        return ""
+
     if not HF_TOKEN:
         return "Missing HF_TOKEN (or HF_API_KEY). You need a HF token with Inference Providers permission."
 
@@ -349,5 +356,6 @@ def run_news_agent(country: str = "us", category: str = "technology", limit: int
 
 
 if __name__ == "__main__":
-    print("Daily Tech Headlines:\n")
-    print(run_news_agent(country="us", category="technology", limit=5))
+    if should_run_on_this_rank():
+        print("Daily Tech Headlines:\n")
+        print(run_news_agent(country="us", category="technology", limit=5))

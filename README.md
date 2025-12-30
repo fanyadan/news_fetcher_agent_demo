@@ -31,8 +31,11 @@ Common (both scripts):
 
 Optional (only for `NEWS_AGENT_DISTRIBUTED_MODE=shard`):
 
-- PyTorch (`torch`) with distributed support
-- `numpy` (required by torch distributed object collectives like `gather_object`)
+- `NEWS_AGENT_DISTRIBUTED_BACKEND=torch`:
+  - PyTorch (`torch`) with distributed support
+  - `numpy` (some torch distributed object collectives can require NumPy)
+- `NEWS_AGENT_DISTRIBUTED_BACKEND=mpi`:
+  - `mpi4py`
 
 For `news_agent_langchain.py` (LangChain agent):
 
@@ -49,8 +52,11 @@ pip install -U requests huggingface_hub
 # Only needed for the LangChain version
 pip install -U langchain langgraph pydantic
 
-# Only needed for shard mode
+# Only needed for shard mode (torch backend)
 pip install -U numpy
+
+# Only needed for shard mode (MPI backend)
+pip install -U mpi4py
 ```
 
 ## Configuration
@@ -76,36 +82,49 @@ Only for `news_agent_langchain.py`:
 
 These scripts do **not** run a local PyTorch model. By default, they call a hosted LLM via `huggingface_hub.InferenceClient` (remote inference over HTTP).
 
-PyTorch is only used **optionally** for **`torch.distributed` process coordination** in `NEWS_AGENT_DISTRIBUTED_MODE=shard` (i.e., spawning multiple ranks, gathering results). It does *not* turn the Hugging Face model into “distributed PyTorch inference”.
+In `NEWS_AGENT_DISTRIBUTED_MODE=shard`, ranks coordinate **optionally** using either **`torch.distributed`** (default, `NEWS_AGENT_DISTRIBUTED_BACKEND=torch`) or **MPI via `mpi4py`** (`NEWS_AGENT_DISTRIBUTED_BACKEND=mpi`). This does *not* turn the Hugging Face model into “distributed PyTorch inference”.
 
 If you run these scripts under a multi-process launcher (e.g. `torchrun`, Slurm, MPI), they default to **rank 0 only** to avoid duplicating external API calls.
 
 - `NEWS_AGENT_DISTRIBUTED_MODE` (optional, default: `rank0`)
   - `rank0`: only rank 0 runs
   - `all`: every rank runs the full pipeline (duplicates work)
-  - `shard`: **torch.distributed** sharded mode.
+  - `shard`: sharded summarization mode.
     - Enabled only when **(1)** `NEWS_AGENT_DISTRIBUTED_MODE=shard` (or `torch` / `torch_shard`) **and (2)** `WORLD_SIZE > 1` (i.e., you actually launched multiple ranks).
-    - Each rank fetches **one** headline (`pageSize=1`, `page=rank+1`) and summarizes locally.
-    - Rank 0 gathers per-rank results (`gather_object` / `all_gather_object`) and assembles the final Markdown digest.
-    - Effective headlines fetched = `min(limit, world_size)`.
-    - Note: shard mode makes **one NewsAPI call + one HF inference call per rank**, so rate limits apply.
-- `NEWS_AGENT_TORCH_BACKEND` (optional, default: `gloo`) — only used in `shard` mode
+    - Rank 0 fetches the headlines **once**, broadcasts the article list to all ranks, and each rank summarizes a slice (round-robin by index).
+    - Rank 0 gathers per-rank results and assembles the final Markdown digest.
+    - Effective headlines fetched = up to `limit` (whatever NewsAPI returns).
+    - Total HF inference calls are ~`limit` (spread across ranks). Provider rate limits still apply.
+- `NEWS_AGENT_DISTRIBUTED_BACKEND` (optional, default: `torch`)
+  - `torch`: use `torch.distributed` collectives
+  - `mpi`: use `mpi4py` collectives
+  - `auto`: prefer `mpi` when launched under MPI env vars; otherwise use `torch`
+- `NEWS_AGENT_TORCH_BACKEND` (optional, default: `gloo`) — only used when `NEWS_AGENT_DISTRIBUTED_BACKEND=torch`
 - Manual overrides (optional): `NEWS_AGENT_RANK`, `NEWS_AGENT_WORLD_SIZE`, `NEWS_AGENT_LOCAL_RANK`.
 
 Example (sharded mode with torchrun):
 
 ```bash
 export NEWS_AGENT_DISTRIBUTED_MODE=shard
+export NEWS_AGENT_DISTRIBUTED_BACKEND=torch
 
-# Fetch 5 headlines (default limit=5) by launching 5 ranks.
-# Tip: set --nproc_per_node == limit for “one headline per rank”.
-torchrun --standalone --nproc_per_node=5 news_agent_hf_toolcall.py
+# Launch multiple ranks; headlines are fetched once and summarization is sharded across ranks.
+torchrun --standalone --nproc_per_node=4 news_agent_hf_toolcall.py
 ```
 
 You can run the LangChain version the same way:
 
 ```bash
-torchrun --standalone --nproc_per_node=5 news_agent_langchain.py
+torchrun --standalone --nproc_per_node=4 news_agent_langchain.py
+```
+
+Example (sharded mode with MPI):
+
+```bash
+export NEWS_AGENT_DISTRIBUTED_MODE=shard
+export NEWS_AGENT_DISTRIBUTED_BACKEND=mpi
+
+mpirun -n 4 python news_agent_hf_toolcall.py
 ```
 
 > Note: Many large models are not available on the free `hf-inference` (serverless) tier and can return 404. Using an Inference Provider (like `novita`) and a compatible model is often required.
@@ -166,7 +185,7 @@ Parameters:
 - `country`: 2-letter country code (e.g. `"us"`)
 - `category`: NewsAPI category (e.g. `"technology"`, `"business"`, `"sports"`)
 - `limit`: number of headlines (int). The tool schema caps tool-called requests at **10**.
-  - In `NEWS_AGENT_DISTRIBUTED_MODE=shard`, each rank fetches **one** headline, so the effective number fetched is `min(limit, world_size)`.
+  - In `NEWS_AGENT_DISTRIBUTED_MODE=shard`, rank 0 fetches headlines once and ranks shard summarization; increasing `WORLD_SIZE` increases parallelism.
 
 ## How it works
 
@@ -221,7 +240,7 @@ export HF_TOKEN="..."
 
 ### `RuntimeError: Numpy is not available`
 
-If you run with `NEWS_AGENT_DISTRIBUTED_MODE=shard`, PyTorch distributed object collectives can require NumPy.
+If you run with `NEWS_AGENT_DISTRIBUTED_MODE=shard` and `NEWS_AGENT_DISTRIBUTED_BACKEND=torch`, PyTorch distributed object collectives can require NumPy.
 
 Fix:
 

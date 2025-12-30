@@ -149,6 +149,29 @@ def _distributed_mode() -> str:
     return (os.getenv("NEWS_AGENT_DISTRIBUTED_MODE") or "rank0").strip().lower()
 
 
+def _distributed_backend() -> str:
+    """Select the sharding communication backend.
+
+    - torch: use torch.distributed collectives
+    - mpi: use mpi4py collectives
+    """
+
+    return (os.getenv("NEWS_AGENT_DISTRIBUTED_BACKEND") or "torch").strip().lower()
+
+
+def _looks_like_mpi_launch() -> bool:
+    # If torchrun env vars are set, prefer torch.distributed in backend=auto.
+    for k in ("RANK", "WORLD_SIZE", "LOCAL_RANK"):
+        if os.getenv(k):
+            return False
+
+    # Common MPI environment variables (OpenMPI/PMI/MVAPICH).
+    for k in ("OMPI_COMM_WORLD_SIZE", "PMI_SIZE", "MV2_COMM_WORLD_SIZE"):
+        if os.getenv(k):
+            return True
+    return False
+
+
 def _strip_code_fences(s: str) -> str:
     s = s.strip()
     if not s.startswith("```"):
@@ -247,13 +270,11 @@ def _format_article_section(*, article: Dict[str, Any], summary: str, why_it_mat
 
 
 def _run_news_agent_torch_sharded(country: str, category: str, limit: int, *, llm: HFInferenceChatModel) -> str:
-    """Sharded execution.
+    """Sharded execution via torch.distributed.
 
-    Unlike the default mode (rank0 fetch + broadcast), in this mode each rank fetches
-    exactly one headline (pageSize=1) and summarizes locally. Results are then gathered
-    and assembled on rank 0.
-
-    To fetch N headlines with this mode, launch N ranks (set --nproc_per_node=N).
+    Rank 0 fetches the headlines once, broadcasts the list of articles to all ranks,
+    and then each rank summarizes a slice of the articles. Summaries are gathered and
+    assembled on rank 0.
     """
 
     ctx = get_distributed_context()
@@ -268,45 +289,40 @@ def _run_news_agent_torch_sharded(country: str, category: str, limit: int, *, ll
     world_size = dist.get_world_size()
 
     requested_limit = int(limit)
-    effective_limit = min(requested_limit, world_size)
 
-    note: str | None = None
-    if rank == 0 and requested_limit > world_size:
-        note = (
-            f"_Note: requested {requested_limit} headlines but world_size={world_size}; "
-            f"fetching {effective_limit} (one per rank). Increase --nproc_per_node to {requested_limit} to fetch {requested_limit}._"
-        )
+    payload: Dict[str, Any] = {}
+    if rank == 0:
+        payload_str = fetch_top_headlines.invoke({"country": country, "category": category, "limit": requested_limit, "page": 1})
+        payload = _parse_json_maybe(payload_str)
+        if not isinstance(payload, dict):
+            payload = {"error": f"Unexpected payload type from fetch_top_headlines: {type(payload)}"}
+        if not isinstance(payload.get("articles"), list):
+            payload.setdefault("articles", [])
+
+    obj_list: List[Any] = [payload]
+    dist.broadcast_object_list(obj_list, src=0)
+    payload_b = obj_list[0] if isinstance(obj_list[0], dict) else {}
+
+    err_msg = payload_b.get("error") if isinstance(payload_b, dict) else None
+    articles_any = payload_b.get("articles") if isinstance(payload_b, dict) else []
+    articles: List[Any] = articles_any if isinstance(articles_any, list) else []
 
     local_sections: List[Dict[str, Any]] = []
+    if not err_msg:
+        for idx, art_any in enumerate(articles):
+            if idx % world_size != rank:
+                continue
 
-    # One headline per rank: rank r fetches page=r+1 (pageSize=1).
-    if rank < effective_limit:
-        idx = rank
-        page = idx + 1
+            art = art_any if isinstance(art_any, dict) else {}
+            try:
+                out = _summarize_one_article_llm(llm, article=art)
+                section_md = _format_article_section(article=art, summary=out["summary"], why_it_matters=out["why_it_matters"])
+            except Exception as e:
+                title = (art.get("title") or "(untitled)").strip()
+                section_md = f"## {title}\n\nFailed to summarize on rank {rank}: {e}"
 
-        payload_str = fetch_top_headlines.invoke({"country": country, "category": category, "limit": 1, "page": page})
-        payload = _parse_json_maybe(payload_str)
+            local_sections.append({"index": idx, "markdown": section_md})
 
-        if not isinstance(payload, dict):
-            local_sections.append({"index": idx, "markdown": f"## (rank {rank})\n\nUnexpected payload type for page {page}."})
-        elif "error" in payload:
-            local_sections.append({"index": idx, "markdown": f"## (rank {rank})\n\nFetch failed for page {page}: {payload['error']}"})
-        else:
-            articles = payload.get("articles") or []
-            if not isinstance(articles, list) or not articles:
-                local_sections.append({"index": idx, "markdown": f"## (rank {rank})\n\nNo article returned for page {page}."})
-            else:
-                art = articles[0] if isinstance(articles[0], dict) else {}
-                try:
-                    out = _summarize_one_article_llm(llm, article=art)
-                    section_md = _format_article_section(article=art, summary=out["summary"], why_it_matters=out["why_it_matters"])
-                except Exception as e:
-                    title = (art.get("title") or "(untitled)").strip()
-                    section_md = f"## {title}\n\nFailed to summarize on rank {rank}: {e}"
-
-                local_sections.append({"index": idx, "markdown": section_md})
-
-    # Gather sections to rank 0.
     all_sections_by_rank: List[Any]
     if hasattr(dist, "gather_object"):
         gather_list = [None for _ in range(world_size)] if rank == 0 else None
@@ -320,6 +336,9 @@ def _run_news_agent_torch_sharded(country: str, category: str, limit: int, *, ll
     if rank != 0:
         return ""
 
+    if err_msg:
+        return str(err_msg)
+
     merged: List[Dict[str, Any]] = []
     for chunk in all_sections_by_rank:
         if isinstance(chunk, list):
@@ -327,12 +346,10 @@ def _run_news_agent_torch_sharded(country: str, category: str, limit: int, *, ll
 
     merged.sort(key=lambda x: int(x.get("index", 0)))
 
-    header = f"# Top {len(merged)} {category.title()} Headlines ({country.upper()})"
+    header = f"# Top {len(articles)} {category.title()} Headlines ({country.upper()})"
     body = "\n\n".join([str(x.get("markdown") or "").strip() for x in merged if x.get("markdown")])
 
     parts = [header]
-    if note:
-        parts.append(note)
     if body:
         parts.append(body)
 
@@ -505,11 +522,117 @@ class HFInferenceChatModel(BaseChatModel):
         return ChatResult(generations=[ChatGeneration(message=ai)])
 
 
+def _try_init_mpi(world_size: int) -> Tuple[Optional[object], Optional[str]]:
+    if world_size <= 1:
+        return None, None
+
+    try:
+        from mpi4py import MPI  # type: ignore
+    except Exception as e:
+        return None, f"Shard mode requires mpi4py, but import failed: {e}"
+
+    comm = getattr(MPI, "COMM_WORLD", None)
+    if comm is None:
+        return None, "mpi4py is installed, but MPI.COMM_WORLD is not available."
+
+    return comm, None
+
+
+def _run_news_agent_mpi_sharded(country: str, category: str, limit: int, *, llm: HFInferenceChatModel) -> str:
+    """Sharded execution via MPI (mpi4py).
+
+    Rank 0 fetches the headlines once, broadcasts the list of articles to all ranks,
+    and then each rank summarizes a slice of the articles. Summaries are gathered and
+    assembled on rank 0.
+    """
+
+    ctx = get_distributed_context()
+    comm, err = _try_init_mpi(ctx.world_size)
+    if err:
+        return err if ctx.is_main else ""
+
+    if comm is None:
+        return ""
+
+    try:
+        rank = int(comm.Get_rank())
+        world_size = int(comm.Get_size())
+    except Exception as e:
+        return f"MPI initialization failed: {e}" if ctx.is_main else ""
+
+    if world_size <= 1:
+        return (
+            "MPI backend selected but MPI world_size=1. Launch with mpirun/srun (multiple ranks), "
+            "or set NEWS_AGENT_DISTRIBUTED_BACKEND=torch."
+            if ctx.is_main
+            else ""
+        )
+
+    requested_limit = int(limit)
+
+    payload: Dict[str, Any] = {}
+    if rank == 0:
+        payload_str = fetch_top_headlines.invoke({"country": country, "category": category, "limit": requested_limit, "page": 1})
+        payload = _parse_json_maybe(payload_str)
+        if not isinstance(payload, dict):
+            payload = {"error": f"Unexpected payload type from fetch_top_headlines: {type(payload)}"}
+        if not isinstance(payload.get("articles"), list):
+            payload.setdefault("articles", [])
+
+    payload_b = comm.bcast(payload, root=0)
+    payload_b = payload_b if isinstance(payload_b, dict) else {}
+
+    err_msg = payload_b.get("error")
+    articles_any = payload_b.get("articles")
+    articles: List[Any] = articles_any if isinstance(articles_any, list) else []
+
+    local_sections: List[Dict[str, Any]] = []
+    if not err_msg:
+        for idx, art_any in enumerate(articles):
+            if idx % world_size != rank:
+                continue
+
+            art = art_any if isinstance(art_any, dict) else {}
+            try:
+                out = _summarize_one_article_llm(llm, article=art)
+                section_md = _format_article_section(article=art, summary=out["summary"], why_it_matters=out["why_it_matters"])
+            except Exception as e:
+                title = (art.get("title") or "(untitled)").strip()
+                section_md = f"## {title}\n\nFailed to summarize on rank {rank}: {e}"
+
+            local_sections.append({"index": idx, "markdown": section_md})
+
+    all_sections_by_rank = comm.gather(local_sections, root=0)
+
+    if rank != 0:
+        return ""
+
+    if err_msg:
+        return str(err_msg)
+
+    merged: List[Dict[str, Any]] = []
+    if isinstance(all_sections_by_rank, list):
+        for chunk in all_sections_by_rank:
+            if isinstance(chunk, list):
+                merged.extend([x for x in chunk if isinstance(x, dict)])
+
+    merged.sort(key=lambda x: int(x.get("index", 0)))
+
+    header = f"# Top {len(articles)} {category.title()} Headlines ({country.upper()})"
+    body = "\n\n".join([str(x.get("markdown") or "").strip() for x in merged if x.get("markdown")])
+
+    parts = [header]
+    if body:
+        parts.append(body)
+
+    return "\n\n".join(parts).strip()
+
+
 def run_news_agent(country: str = "us", category: str = "technology", limit: int = 5) -> str:
     mode = _distributed_mode()
     ctx = get_distributed_context()
 
-    # Sharded distributed mode (torch.distributed): rank0 fetches once, ranks shard summarization,
+    # Sharded distributed mode: rank0 fetches once, ranks shard summarization,
     # then results are gathered and assembled on rank0.
     if mode in {"shard", "torch", "torch_shard", "torch-shard"} and ctx.world_size > 1:
         if not HF_TOKEN:
@@ -523,6 +646,17 @@ def run_news_agent(country: str = "us", category: str = "technology", limit: int
             temperature=HF_TEMPERATURE,
         )
 
+        backend = _distributed_backend()
+
+        if backend in {"mpi", "mpi4py"}:
+            return _run_news_agent_mpi_sharded(country=country, category=category, limit=limit, llm=llm_shard)
+
+        if backend == "auto":
+            if _looks_like_mpi_launch():
+                return _run_news_agent_mpi_sharded(country=country, category=category, limit=limit, llm=llm_shard)
+            return _run_news_agent_torch_sharded(country=country, category=category, limit=limit, llm=llm_shard)
+
+        # default: torch
         return _run_news_agent_torch_sharded(country=country, category=category, limit=limit, llm=llm_shard)
 
     # Default behavior: rank-0 only (unless mode=all).

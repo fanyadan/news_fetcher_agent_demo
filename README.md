@@ -74,12 +74,21 @@ Only for `news_agent_langchain.py`:
 
 ### Distributed / multi-process execution
 
+These scripts do **not** run a local PyTorch model. By default, they call a hosted LLM via `huggingface_hub.InferenceClient` (remote inference over HTTP).
+
+PyTorch is only used **optionally** for **`torch.distributed` process coordination** in `NEWS_AGENT_DISTRIBUTED_MODE=shard` (i.e., spawning multiple ranks, gathering results). It does *not* turn the Hugging Face model into “distributed PyTorch inference”.
+
 If you run these scripts under a multi-process launcher (e.g. `torchrun`, Slurm, MPI), they default to **rank 0 only** to avoid duplicating external API calls.
 
 - `NEWS_AGENT_DISTRIBUTED_MODE` (optional, default: `rank0`)
   - `rank0`: only rank 0 runs
   - `all`: every rank runs the full pipeline (duplicates work)
-  - `shard`: **torch.distributed** sharded mode — each rank fetches **one** headline (`pageSize=1`, `page=rank+1`) and summarizes locally, then rank 0 gathers and assembles the final output. Effective headlines fetched = `min(limit, world_size)`.
+  - `shard`: **torch.distributed** sharded mode.
+    - Enabled only when **(1)** `NEWS_AGENT_DISTRIBUTED_MODE=shard` (or `torch` / `torch_shard`) **and (2)** `WORLD_SIZE > 1` (i.e., you actually launched multiple ranks).
+    - Each rank fetches **one** headline (`pageSize=1`, `page=rank+1`) and summarizes locally.
+    - Rank 0 gathers per-rank results (`gather_object` / `all_gather_object`) and assembles the final Markdown digest.
+    - Effective headlines fetched = `min(limit, world_size)`.
+    - Note: shard mode makes **one NewsAPI call + one HF inference call per rank**, so rate limits apply.
 - `NEWS_AGENT_TORCH_BACKEND` (optional, default: `gloo`) — only used in `shard` mode
 - Manual overrides (optional): `NEWS_AGENT_RANK`, `NEWS_AGENT_WORLD_SIZE`, `NEWS_AGENT_LOCAL_RANK`.
 
@@ -89,7 +98,14 @@ Example (sharded mode with torchrun):
 export NEWS_AGENT_DISTRIBUTED_MODE=shard
 
 # Fetch 5 headlines (default limit=5) by launching 5 ranks.
+# Tip: set --nproc_per_node == limit for “one headline per rank”.
 torchrun --standalone --nproc_per_node=5 news_agent_hf_toolcall.py
+```
+
+You can run the LangChain version the same way:
+
+```bash
+torchrun --standalone --nproc_per_node=5 news_agent_langchain.py
 ```
 
 > Note: Many large models are not available on the free `hf-inference` (serverless) tier and can return 404. Using an Inference Provider (like `novita`) and a compatible model is often required.

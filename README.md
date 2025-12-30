@@ -29,6 +29,11 @@ Common (both scripts):
   - `requests`
   - `huggingface_hub`
 
+Optional (only for `NEWS_AGENT_DISTRIBUTED_MODE=shard`):
+
+- PyTorch (`torch`) with distributed support
+- `numpy` (required by torch distributed object collectives like `gather_object`)
+
 For `news_agent_langchain.py` (LangChain agent):
 
 - Python packages:
@@ -43,6 +48,9 @@ pip install -U requests huggingface_hub
 
 # Only needed for the LangChain version
 pip install -U langchain langgraph pydantic
+
+# Only needed for shard mode
+pip install -U numpy
 ```
 
 ## Configuration
@@ -68,8 +76,21 @@ Only for `news_agent_langchain.py`:
 
 If you run these scripts under a multi-process launcher (e.g. `torchrun`, Slurm, MPI), they default to **rank 0 only** to avoid duplicating external API calls.
 
-- `NEWS_AGENT_DISTRIBUTED_MODE` (optional, default: `rank0`) — set to `all` to run on every rank.
+- `NEWS_AGENT_DISTRIBUTED_MODE` (optional, default: `rank0`)
+  - `rank0`: only rank 0 runs
+  - `all`: every rank runs the full pipeline (duplicates work)
+  - `shard`: **torch.distributed** sharded mode — each rank fetches **one** headline (`pageSize=1`, `page=rank+1`) and summarizes locally, then rank 0 gathers and assembles the final output. Effective headlines fetched = `min(limit, world_size)`.
+- `NEWS_AGENT_TORCH_BACKEND` (optional, default: `gloo`) — only used in `shard` mode
 - Manual overrides (optional): `NEWS_AGENT_RANK`, `NEWS_AGENT_WORLD_SIZE`, `NEWS_AGENT_LOCAL_RANK`.
+
+Example (sharded mode with torchrun):
+
+```bash
+export NEWS_AGENT_DISTRIBUTED_MODE=shard
+
+# Fetch 5 headlines (default limit=5) by launching 5 ranks.
+torchrun --standalone --nproc_per_node=5 news_agent_hf_toolcall.py
+```
 
 > Note: Many large models are not available on the free `hf-inference` (serverless) tier and can return 404. Using an Inference Provider (like `novita`) and a compatible model is often required.
 
@@ -129,13 +150,14 @@ Parameters:
 - `country`: 2-letter country code (e.g. `"us"`)
 - `category`: NewsAPI category (e.g. `"technology"`, `"business"`, `"sports"`)
 - `limit`: number of headlines (int). The tool schema caps tool-called requests at **10**.
+  - In `NEWS_AGENT_DISTRIBUTED_MODE=shard`, each rank fetches **one** headline, so the effective number fetched is `min(limit, world_size)`.
 
 ## How it works
 
 ### Tool: `fetch_top_headlines`
 
-- Implemented in `fetch_top_headlines(country, category, limit)`
-- Calls `https://newsapi.org/v2/top-headlines`
+- Implemented in `fetch_top_headlines(country, category, limit, page=1)`
+- Calls `https://newsapi.org/v2/top-headlines` (supports pagination via the `page` parameter)
 - Returns a trimmed JSON payload containing:
   - `title`
   - `description`
@@ -179,6 +201,16 @@ Set `HF_TOKEN` (or `HUGGINGFACEHUB_API_TOKEN` / `HF_API_KEY`):
 
 ```bash
 export HF_TOKEN="..."
+```
+
+### `RuntimeError: Numpy is not available`
+
+If you run with `NEWS_AGENT_DISTRIBUTED_MODE=shard`, PyTorch distributed object collectives can require NumPy.
+
+Fix:
+
+```bash
+pip install -U numpy
 ```
 
 ### Missing LangChain dependencies

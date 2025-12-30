@@ -1,12 +1,21 @@
 import json
 import os
-from typing import Any, Dict, List
+import subprocess
+import sys
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
-from huggingface_hub import InferenceClient
-from huggingface_hub.errors import BadRequestError, HfHubHTTPError
+try:
+    from huggingface_hub import InferenceClient
+    from huggingface_hub.errors import BadRequestError, HfHubHTTPError
+except ImportError:
+    import subprocess
+    import sys
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "huggingface_hub"])
+    from huggingface_hub import InferenceClient
+    from huggingface_hub.errors import BadRequestError, HfHubHTTPError
 
-from dist_utils import rank0_print, should_run_on_this_rank
+from dist_utils import get_distributed_context, rank0_print, should_run_on_this_rank
 
 
 HF_TOKEN = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACEHUB_API_TOKEN") or os.getenv("HF_API_KEY")
@@ -18,7 +27,7 @@ HF_MODEL = os.getenv("HF_MODEL", "zai-org/GLM-4.6")
 NEWS_API_KEY = os.getenv("NEWS_API_KEY")
 
 
-def fetch_top_headlines(country: str, category: str, limit: int) -> Dict[str, Any]:
+def fetch_top_headlines(country: str, category: str, limit: int, page: int = 1) -> Dict[str, Any]:
     """
     Tool: fetch live headlines from NewsAPI.
     """
@@ -31,6 +40,7 @@ def fetch_top_headlines(country: str, category: str, limit: int) -> Dict[str, An
         "country": country,
         "category": category,
         "pageSize": limit,
+        "page": page,
     }
 
     try:
@@ -66,6 +76,7 @@ TOOLS = [
                     "country": {"type": "string", "description": "2-letter country code, e.g. 'us'."},
                     "category": {"type": "string", "description": "News category, e.g. 'technology'."},
                     "limit": {"type": "integer", "minimum": 1, "maximum": 10, "description": "Number of headlines."},
+                    "page": {"type": "integer", "minimum": 1, "description": "Page number (1-indexed)."},
                 },
                 "required": ["country", "category", "limit"],
                 "additionalProperties": False,
@@ -92,9 +103,229 @@ def _parse_tool_args(tool_call: Dict[str, Any]) -> Dict[str, Any]:
     return args
 
 
+def _distributed_mode() -> str:
+    return (os.getenv("NEWS_AGENT_DISTRIBUTED_MODE") or "rank0").strip().lower()
+
+
+def _strip_code_fences(s: str) -> str:
+    s = s.strip()
+    if not s.startswith("```"):
+        return s
+    lines = s.splitlines()
+    if len(lines) >= 2 and lines[0].strip().startswith("```"):
+        lines = lines[1:]
+    if lines and lines[-1].strip() == "```":
+        lines = lines[:-1]
+    return "\n".join(lines).strip()
+
+
+def _extract_json_object(text: str) -> Dict[str, Any]:
+    text = _strip_code_fences(text)
+    text = text.strip()
+    if not text:
+        return {}
+
+    # Best-effort JSON extraction (handles extra pre/post text).
+    start = text.find("{")
+    end = text.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        return {}
+
+    candidate = text[start : end + 1]
+    try:
+        obj = json.loads(candidate)
+        return obj if isinstance(obj, dict) else {}
+    except json.JSONDecodeError:
+        return {}
+
+
+def _try_init_torch_distributed(world_size: int) -> Tuple[Optional[object], Optional[str]]:
+    if world_size <= 1:
+        return None, None
+
+    try:
+        import torch.distributed as dist  # type: ignore
+    except Exception as e:
+        return None, f"Shard mode requires torch.distributed, but import failed: {e}"
+
+    if not getattr(dist, "is_available", lambda: False)():
+        return None, "Shard mode requires torch.distributed, but it is not available in this torch build."
+
+    if not dist.is_initialized():
+        backend = os.getenv("NEWS_AGENT_TORCH_BACKEND", "gloo")
+        try:
+            dist.init_process_group(backend=backend, init_method="env://")
+        except Exception as e:
+            return None, f"torch.distributed init_process_group failed: {e}"
+
+    return dist, None
+
+
+def _summarize_one_article(client: InferenceClient, *, article: Dict[str, Any]) -> Dict[str, str]:
+    title = (article.get("title") or "").strip()
+    description = (article.get("description") or "").strip()
+    source = (article.get("source") or "").strip()
+
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You are a news assistant. Use ONLY the provided title/description (no outside knowledge). "
+                "Return a JSON object with keys: summary (exactly 2 sentences), why_it_matters (1 sentence). "
+                "Return JSON only."
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                f"Title: {title}\n"
+                f"Description: {description}\n"
+                f"Source: {source}\n"
+            ),
+        },
+    ]
+
+    resp = client.chat_completion(
+        model=HF_MODEL,
+        messages=messages,
+        max_tokens=300,
+        temperature=0.2,
+    )
+
+    text = (resp.choices[0].message.content or "").strip()
+    obj = _extract_json_object(text)
+    summary = (obj.get("summary") or "").strip()
+    why = (obj.get("why_it_matters") or obj.get("why") or "").strip()
+
+    if not summary:
+        # Fallback: take the raw text as the summary.
+        summary = text
+
+    return {"summary": summary, "why_it_matters": why}
+
+
+def _format_article_section(*, article: Dict[str, Any], summary: str, why_it_matters: str) -> str:
+    title = (article.get("title") or "(untitled)").strip()
+    url = (article.get("url") or "").strip()
+
+    lines: List[str] = [f"## {title}", summary.strip()]
+
+    if why_it_matters.strip():
+        lines.append(f"- Why it matters: {why_it_matters.strip()}")
+    else:
+        lines.append("- Why it matters: (not provided)")
+
+    if url:
+        lines.append(url)
+
+    return "\n\n".join([x for x in lines if x]).strip()
+
+
+def _run_news_agent_torch_sharded(country: str, category: str, limit: int) -> str:
+    """Sharded execution.
+
+    In this mode each rank fetches exactly one headline (pageSize=1) and summarizes
+    locally. Results are gathered and assembled on rank 0.
+
+    To fetch N headlines with this mode, launch N ranks (set --nproc_per_node=N).
+    """
+
+    ctx = get_distributed_context()
+    dist, err = _try_init_torch_distributed(ctx.world_size)
+    if err:
+        return err if ctx.is_main else ""
+
+    # If we're not actually distributed, fall back to the single-process path.
+    if dist is None or not dist.is_initialized():
+        return ""
+
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+
+    requested_limit = int(limit)
+    effective_limit = min(requested_limit, world_size)
+
+    note: str | None = None
+    if rank == 0 and requested_limit > world_size:
+        note = (
+            f"_Note: requested {requested_limit} headlines but world_size={world_size}; "
+            f"fetching {effective_limit} (one per rank). Increase --nproc_per_node to {requested_limit} to fetch {requested_limit}._"
+        )
+
+    local_sections: List[Dict[str, Any]] = []
+
+    # One headline per rank: rank r fetches page=r+1 (pageSize=1).
+    if rank < effective_limit:
+        idx = rank
+        page = idx + 1
+
+        payload = fetch_top_headlines(country=country, category=category, limit=1, page=page)
+
+        if not isinstance(payload, dict):
+            local_sections.append({"index": idx, "markdown": f"## (rank {rank})\n\nUnexpected payload type for page {page}."})
+        elif "error" in payload:
+            local_sections.append({"index": idx, "markdown": f"## (rank {rank})\n\nFetch failed for page {page}: {payload['error']}"})
+        else:
+            articles = payload.get("articles") or []
+            if not isinstance(articles, list) or not articles:
+                local_sections.append({"index": idx, "markdown": f"## (rank {rank})\n\nNo article returned for page {page}."})
+            else:
+                art = articles[0] if isinstance(articles[0], dict) else {}
+                client = InferenceClient(provider=HF_PROVIDER, api_key=HF_TOKEN)
+                try:
+                    out = _summarize_one_article(client, article=art)
+                    section_md = _format_article_section(article=art, summary=out["summary"], why_it_matters=out["why_it_matters"])
+                except Exception as e:
+                    title = (art.get("title") or "(untitled)").strip()
+                    section_md = f"## {title}\n\nFailed to summarize on rank {rank}: {e}"
+
+                local_sections.append({"index": idx, "markdown": section_md})
+
+    # Gather sections to rank 0.
+    all_sections_by_rank: List[Any]
+    if hasattr(dist, "gather_object"):
+        gather_list = [None for _ in range(world_size)] if rank == 0 else None
+        dist.gather_object(local_sections, gather_list, dst=0)
+        all_sections_by_rank = gather_list or []
+    else:
+        gather_list = [None for _ in range(world_size)]
+        dist.all_gather_object(gather_list, local_sections)
+        all_sections_by_rank = gather_list
+
+    if rank != 0:
+        return ""
+
+    merged: List[Dict[str, Any]] = []
+    for chunk in all_sections_by_rank:
+        if isinstance(chunk, list):
+            merged.extend([x for x in chunk if isinstance(x, dict)])
+
+    merged.sort(key=lambda x: int(x.get("index", 0)))
+
+    header = f"# Top {len(merged)} {category.title()} Headlines ({country.upper()})"
+    body = "\n\n".join([str(x.get("markdown") or "").strip() for x in merged if x.get("markdown")])
+
+    parts = [header]
+    if note:
+        parts.append(note)
+    if body:
+        parts.append(body)
+
+    return "\n\n".join(parts).strip()
+
+
 def run_news_agent(country: str = "us", category: str = "technology", limit: int = 5) -> str:
-    # In distributed/multi-process launches (torchrun/Slurm/MPI), default to rank-0 only to
-    # avoid duplicating API calls and rate-limiting.
+    mode = _distributed_mode()
+    ctx = get_distributed_context()
+
+    # Sharded distributed mode (torch.distributed): each rank fetches one headline + summarizes,
+    # then results are gathered and assembled on rank0.
+    if mode in {"shard", "torch", "torch_shard", "torch-shard"} and ctx.world_size > 1:
+        if not HF_TOKEN:
+            return "Missing HF_TOKEN (or HF_API_KEY). You need a HF token with Inference Providers permission." if ctx.is_main else ""
+        return _run_news_agent_torch_sharded(country=country, category=category, limit=limit)
+
+    # Default behavior: rank-0 only (unless mode=all).
     if not should_run_on_this_rank():
         return ""
 
@@ -237,6 +468,7 @@ def run_news_agent(country: str = "us", category: str = "technology", limit: int
 
 
 if __name__ == "__main__":
+    md = run_news_agent(country="us", category="technology", limit=5)
     if should_run_on_this_rank():
         print("Daily Tech Headlines:\n")
-        print(run_news_agent(country="us", category="technology", limit=5))
+        print(md)

@@ -602,7 +602,7 @@ def run_news_agent(country: str = "us", category: str = "technology", limit: int
 
 
 if __name__ == "__main__":
-    md = run_news_agent(country="us", category="technology", limit=5)
+    md = run_news_agent(country="us", category="technology", limit=10)
     if should_run_on_this_rank():
         print("Daily Tech Headlines:\n")
         print(md)

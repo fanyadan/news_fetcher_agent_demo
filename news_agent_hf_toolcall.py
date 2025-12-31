@@ -15,7 +15,13 @@ except ImportError:
     from huggingface_hub import InferenceClient
     from huggingface_hub.errors import BadRequestError, HfHubHTTPError
 
-from dist_utils import get_distributed_context, rank0_print, should_run_on_this_rank
+from dist_utils import (
+    get_distributed_context,
+    is_truthy_env,
+    mpi_sanity_check,
+    rank0_print,
+    should_run_on_this_rank,
+)
 
 
 HF_TOKEN = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACEHUB_API_TOKEN") or os.getenv("HF_API_KEY")
@@ -378,6 +384,11 @@ def _run_news_agent_mpi_sharded(country: str, category: str, limit: int) -> str:
             if ctx.is_main
             else ""
         )
+
+    if is_truthy_env("NEWS_AGENT_MPI_CHECK"):
+        chk_err = mpi_sanity_check(comm, verbose=True, tag="news_agent_hf_toolcall")
+        if chk_err:
+            return chk_err if rank == 0 else ""
 
     requested_limit = int(limit)
 

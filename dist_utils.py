@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import os
+import socket
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 
 _TRUE_VALUES = {"1", "true", "yes", "y", "on"}
@@ -128,6 +129,81 @@ def rank0_print(*args: object, **kwargs: object) -> None:
 
     if should_run_on_this_rank():
         print(*args, **kwargs)
+
+
+def mpi_sanity_check(comm: object, *, verbose: bool = False, tag: str = "") -> Optional[str]:
+    """Lightweight best-effort MPI communication check.
+
+    This is intended for debugging when launching under MPI (via mpi4py).
+
+    It performs:
+    - A ring send/recv (point-to-point)
+    - An allgather of basic rank metadata
+    - A barrier
+
+    Returns an error string if the check fails, otherwise None.
+    """
+
+    try:
+        if comm is None:
+            return "MPI check failed: comm is None"
+
+        rank = int(comm.Get_rank())
+        world_size = int(comm.Get_size())
+
+        if world_size <= 1:
+            return None
+
+        # Point-to-point ring check.
+        next_rank = (rank + 1) % world_size
+        prev_rank = (rank - 1) % world_size
+        sent = {"from": rank, "to": next_rank}
+        received = comm.sendrecv(sent, dest=next_rank, source=prev_rank)
+        if not isinstance(received, dict) or int(received.get("from", -1)) != prev_rank:
+            return (
+                f"MPI ring check failed on rank {rank}: expected message from rank {prev_rank}, "
+                f"got {received!r}"
+            )
+
+        # Collective allgather check.
+        info = {"rank": rank, "pid": os.getpid(), "host": socket.gethostname()}
+        gathered = comm.allgather(info)
+
+        if not isinstance(gathered, list) or len(gathered) != world_size:
+            got_len = len(gathered) if isinstance(gathered, list) else "n/a"
+            return (
+                f"MPI allgather check failed on rank {rank}: expected list of len {world_size}, "
+                f"got {type(gathered)} len {got_len}"
+            )
+
+        ranks: List[int] = []
+        hosts: Dict[str, int] = {}
+        for item in gathered:
+            if not isinstance(item, dict):
+                continue
+            r = item.get("rank")
+            if isinstance(r, int):
+                ranks.append(r)
+            h = item.get("host")
+            if isinstance(h, str):
+                hosts[h] = hosts.get(h, 0) + 1
+
+        if sorted(ranks) != list(range(world_size)):
+            return (
+                f"MPI allgather ranks mismatch on rank {rank}: expected ranks 0..{world_size - 1}, "
+                f"got {sorted(ranks)}"
+            )
+
+        # Barrier so we know all ranks reached the check.
+        comm.Barrier()
+
+        if verbose and rank == 0:
+            label = f"[mpi-check:{tag}]" if tag else "[mpi-check]"
+            print(f"{label} ok: world_size={world_size}, hosts={hosts}")
+
+        return None
+    except Exception as e:
+        return f"MPI check failed: {e}"
 
 
 def get_rank_and_world_size() -> Tuple[int, int]:

@@ -6,7 +6,12 @@ import os
 import ssl
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from dist_utils import get_distributed_context, should_run_on_this_rank
+from dist_utils import (
+    get_distributed_context,
+    is_truthy_env,
+    mpi_sanity_check,
+    should_run_on_this_rank,
+)
 
 # Third-party imports
 import requests
@@ -567,6 +572,11 @@ def _run_news_agent_mpi_sharded(country: str, category: str, limit: int, *, llm:
             if ctx.is_main
             else ""
         )
+
+    if is_truthy_env("NEWS_AGENT_MPI_CHECK"):
+        chk_err = mpi_sanity_check(comm, verbose=True, tag="news_agent_langchain")
+        if chk_err:
+            return chk_err if rank == 0 else ""
 
     requested_limit = int(limit)
 

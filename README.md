@@ -100,6 +100,9 @@ If you run these scripts under a multi-process launcher (e.g. `torchrun`, Slurm,
   - `mpi`: use `mpi4py` collectives
   - `auto`: prefer `mpi` when launched under MPI env vars; otherwise use `torch`
 - `NEWS_AGENT_TORCH_BACKEND` (optional, default: `gloo`) — only used when `NEWS_AGENT_DISTRIBUTED_BACKEND=torch`
+- `NEWS_AGENT_MPI_CHECK` (optional, default: off) — when `NEWS_AGENT_DISTRIBUTED_BACKEND=mpi`, run a small MPI sanity check (ring send/recv + allgather + barrier) and print a `[mpi-check:...] ok` line from rank 0.
+  - Useful to confirm ranks can communicate via MPI.
+  - If you use `mpirun --tag-output`, Open MPI will prefix each line with something like `[1,0]<stdout>:`.
 - Manual overrides (optional): `NEWS_AGENT_RANK`, `NEWS_AGENT_WORLD_SIZE`, `NEWS_AGENT_LOCAL_RANK`.
 
 Example (sharded mode with torchrun):
@@ -123,6 +126,9 @@ Example (sharded mode with MPI):
 ```bash
 export NEWS_AGENT_DISTRIBUTED_MODE=shard
 export NEWS_AGENT_DISTRIBUTED_BACKEND=mpi
+
+# Optional: verify that ranks can communicate via MPI.
+export NEWS_AGENT_MPI_CHECK=1
 
 mpirun -n 4 python news_agent_hf_toolcall.py
 ```

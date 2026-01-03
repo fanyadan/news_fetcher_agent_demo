@@ -450,7 +450,7 @@ def _run_news_agent_mpi_sharded(country: str, category: str, limit: int) -> str:
     return "\n\n".join(parts).strip()
 
 
-def run_news_agent(country: str = "us", category: str = "technology", limit: int = 5) -> str:
+def run_news_agent(country: str, category: str, limit: int) -> str:
     mode = _distributed_mode()
     ctx = get_distributed_context()
 

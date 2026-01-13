@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import os
 import ssl
+import time
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from dist_utils import (
@@ -12,6 +13,8 @@ from dist_utils import (
     mpi_sanity_check,
     should_run_on_this_rank,
 )
+
+import metrics
 
 # Third-party imports
 import requests
@@ -103,6 +106,9 @@ class FetchTopHeadlinesArgs(BaseModel):
 @tool("fetch_top_headlines", args_schema=FetchTopHeadlinesArgs)
 def fetch_top_headlines(country: str, category: str, limit: int, page: int = 1) -> str:
     """Fetch top headlines (live) from NewsAPI."""
+
+    metrics.setup()
+
     if not NEWS_API_KEY:
         return json.dumps({"error": "Missing NEWS_API_KEY"})
 
@@ -115,11 +121,13 @@ def fetch_top_headlines(country: str, category: str, limit: int, page: int = 1) 
         "page": page,
     }
 
+    t0 = time.monotonic()
     try:
         r = requests.get(url, params=params, timeout=30)
         r.raise_for_status()
         data = r.json()
     except Exception as e:
+        metrics.observe_newsapi_request(ok=False, duration_seconds=time.monotonic() - t0)
         return json.dumps({"error": f"NewsAPI request failed: {e}"})
 
     articles = data.get("articles") or []
@@ -134,6 +142,7 @@ def fetch_top_headlines(country: str, category: str, limit: int, page: int = 1) 
             }
         )
 
+    metrics.observe_newsapi_request(ok=True, duration_seconds=time.monotonic() - t0, articles=len(trimmed))
     return json.dumps({"articles": trimmed}, ensure_ascii=False)
 
 
@@ -246,7 +255,15 @@ def _summarize_one_article_llm(llm: HFInferenceChatModel, *, article: Dict[str, 
         HumanMessage(content=f"Title: {title}\nDescription: {description}\nSource: {source}\n"),
     ]
 
-    content = (llm.invoke(messages).content or "").strip()
+    metrics.setup()
+
+    try:
+        content = (llm.invoke(messages).content or "").strip()
+        metrics.inc_articles_summarized(ok=True)
+    except Exception:
+        metrics.inc_articles_summarized(ok=False)
+        raise
+
     obj = _extract_json_object(content)
     summary = (obj.get("summary") or "").strip()
     why = (obj.get("why_it_matters") or obj.get("why") or "").strip()
@@ -502,7 +519,16 @@ class HFInferenceChatModel(BaseChatModel):
         if stop:
             params["stop"] = stop
 
-        resp = self._client.chat_completion(**params)
+        metrics.setup()
+
+        t0 = time.monotonic()
+        try:
+            resp = self._client.chat_completion(**params)
+            metrics.observe_hf_chat_completion(ok=True, duration_seconds=time.monotonic() - t0)
+        except Exception:
+            metrics.observe_hf_chat_completion(ok=False, duration_seconds=time.monotonic() - t0)
+            raise
+
         msg = resp.choices[0].message
 
         tool_calls: List[Dict[str, Any]] = []
@@ -639,6 +665,8 @@ def _run_news_agent_mpi_sharded(country: str, category: str, limit: int, *, llm:
 
 
 def run_news_agent(country: str, category: str, limit: int) -> str:
+    metrics.setup()
+
     mode = _distributed_mode()
     ctx = get_distributed_context()
 
@@ -750,3 +778,9 @@ if __name__ == "__main__":
     if should_run_on_this_rank():
         print("Daily Tech Headlines:\n")
         print(md)
+
+    # Optional: keep the process alive so Prometheus/Grafana can scrape /metrics
+    # even if the job finishes quickly.
+    grace = int(os.getenv("NEWS_AGENT_METRICS_GRACE_SECONDS", "0"))
+    if grace > 0:
+        time.sleep(grace)

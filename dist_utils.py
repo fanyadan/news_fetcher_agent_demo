@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import socket
+import subprocess
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -204,6 +205,110 @@ def mpi_sanity_check(comm: object, *, verbose: bool = False, tag: str = "") -> O
         return None
     except Exception as e:
         return f"MPI check failed: {e}"
+
+
+def _first_nonempty_env(*keys: str) -> Optional[str]:
+    for k in keys:
+        v = os.getenv(k)
+        if v is None:
+            continue
+        v = v.strip()
+        if v:
+            return v
+    return None
+
+
+def _slurm_first_hostname() -> Optional[str]:
+    """Best-effort resolve the first hostname in the Slurm nodelist.
+
+    Uses `scontrol show hostnames` when available; otherwise falls back to a
+    minimal parser for common nodelist formats.
+    """
+
+    nodelist = _first_nonempty_env("SLURM_STEP_NODELIST", "SLURM_NODELIST", "SLURM_JOB_NODELIST")
+    if not nodelist:
+        return None
+
+    # Prefer Slurm's own expansion logic.
+    try:
+        out = subprocess.check_output(
+            ["scontrol", "show", "hostnames", nodelist],
+            stderr=subprocess.DEVNULL,
+            text=True,
+        )
+        for line in out.splitlines():
+            line = line.strip()
+            if line:
+                return line
+    except Exception:
+        pass
+
+    # Fallback parsing.
+    nl = nodelist.strip().split()[0]
+
+    # Comma-separated list: nodeA,nodeB,...
+    if "," in nl:
+        return nl.split(",", 1)[0]
+
+    # Bracketed: node[01-04] or node[01-04,07]
+    if "[" in nl and "]" in nl:
+        prefix = nl.split("[", 1)[0]
+        inside = nl.split("[", 1)[1].split("]", 1)[0]
+        first_chunk = inside.split(",", 1)[0]
+        first = first_chunk.split("-", 1)[0]
+        return f"{prefix}{first}"
+
+    # Plain hostname.
+    return nl
+
+
+def ensure_torch_distributed_env(ctx: Optional[DistributedContext] = None) -> None:
+    """Populate torch.distributed env:// variables from common launchers.
+
+    PyTorch's default rendezvous (`init_method="env://"`) requires:
+    - RANK / WORLD_SIZE
+    - MASTER_ADDR / MASTER_PORT
+    - (optionally) LOCAL_RANK
+
+    Slurm sets SLURM_PROCID / SLURM_NTASKS / SLURM_LOCALID, but does *not* set
+    RANK/WORLD_SIZE, so we map them here.
+
+    This function is idempotent and will not override variables that are already set.
+    """
+
+    if ctx is None:
+        ctx = get_distributed_context()
+
+    os.environ.setdefault("RANK", str(int(ctx.rank)))
+    os.environ.setdefault("WORLD_SIZE", str(int(ctx.world_size)))
+
+    if ctx.local_rank is not None:
+        os.environ.setdefault("LOCAL_RANK", str(int(ctx.local_rank)))
+
+    # Allow explicit overrides via NEWS_AGENT_*.
+    if "MASTER_ADDR" not in os.environ:
+        master_addr = _first_nonempty_env("NEWS_AGENT_MASTER_ADDR")
+        if not master_addr:
+            master_addr = _slurm_first_hostname()
+        if not master_addr:
+            # Reasonable default for single-node runs.
+            master_addr = "127.0.0.1"
+        os.environ["MASTER_ADDR"] = master_addr
+
+    if "MASTER_PORT" not in os.environ:
+        master_port = _first_nonempty_env("NEWS_AGENT_MASTER_PORT")
+        if master_port:
+            os.environ["MASTER_PORT"] = master_port
+        else:
+            # Stable-ish default to reduce collisions when multiple jobs run.
+            base = 29500
+            job_id = _int_env("SLURM_JOB_ID", "SLURM_JOBID")
+            step_id = _int_env("SLURM_STEP_ID")
+            if job_id is not None:
+                base += int(job_id) % 1000
+            if step_id is not None:
+                base += int(step_id) % 100
+            os.environ["MASTER_PORT"] = str(base)
 
 
 def get_rank_and_world_size() -> Tuple[int, int]:

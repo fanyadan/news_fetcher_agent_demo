@@ -17,6 +17,7 @@ except ImportError:
     from huggingface_hub.errors import BadRequestError, HfHubHTTPError
 
 from dist_utils import (
+    ensure_torch_distributed_env,
     get_distributed_context,
     is_truthy_env,
     mpi_sanity_check,
@@ -193,6 +194,8 @@ def _try_init_torch_distributed(world_size: int) -> Tuple[Optional[object], Opti
     if not dist.is_initialized():
         backend = os.getenv("NEWS_AGENT_TORCH_BACKEND", "gloo")
         try:
+            # Slurm sets SLURM_PROCID/SLURM_NTASKS but not RANK/WORLD_SIZE; map them.
+            ensure_torch_distributed_env()
             dist.init_process_group(backend=backend, init_method="env://")
         except Exception as e:
             return None, f"torch.distributed init_process_group failed: {e}"
